@@ -6,9 +6,13 @@ from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.prompts import PromptTemplate
-from langchain_docling.loader import DoclingLoader
+#from langchain_docling.loader import DoclingLoader
+from langchain_community.document_loaders import PyMuPDFLoader 
+from langchain_community.document_loaders.parsers import LLMImageBlobParser
 from langchain_core.output_parsers import StrOutputParser
-
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
+from langchain_community.document_compressors.rankllm_rerank import RankLLMRerank
 
 load_dotenv()
 app = FastAPI()
@@ -25,11 +29,12 @@ prompt = PromptTemplate(
 )
 parser = StrOutputParser()
 vector_store = PineconeVectorStore(index=pc.Index(index_name), embedding=embeddings)
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
 chain = prompt | model | parser
 
 @app.get("/health")
-def health_check():
+async def health_check():
     return {"status": "healthy"}
 
 
@@ -41,24 +46,47 @@ async def upload_file(file: UploadFile = File(...)):
         temp_file.write(await file.read())
         temp_file_path = temp_file.name
 
-    loader = DoclingLoader(temp_file_path)
+    loader = PyMuPDFLoader(
+        temp_file_path,
+        mode="page",
+        images_inner_format="markdown-img",
+        images_parser=LLMImageBlobParser(model=ChatOpenAI(model="gpt-4o-mini")),
+    )
+
     documents = loader.load()
-    # remove all the metadata from the documents
-    for doc in documents:
-        doc.metadata = {}
+    os.remove(temp_file_path)
     # add the documents to the vector store
+    documents = text_splitter.split_documents(documents)
     vector_store.add_documents(documents)
     return {"status": "success", "message": f"Uploaded {len(documents)} documents."}
 
 
 chat_history = []
+chunks = []
 
 @app.post("/ask/")
-def ask_question(question: str):
+async def ask_question(question: str):
     global chat_history
+    global chunks
     chat_history.append({"role": "user", "content": question})
-    docs = vector_store.similarity_search(question, k=3)
-    context = "\n".join([doc.page_content for doc in docs])
+    retriever = vector_store.as_retriever()
+    compressor = RankLLMRerank(top_n=5, model="gpt", gpt_model="gpt-4o-mini")
+    compression_retriever = ContextualCompressionRetriever(
+    base_compressor=compressor, base_retriever=retriever
+)
+    compressed_docs = compression_retriever.invoke(question)
+    chunks.append(compressed_docs)
+    context = "\n\n".join([doc.page_content for doc in compressed_docs])
     answer = chain.invoke({"context": context, "question": question})
     chat_history.append({"role": "assistant", "content": answer})
     return {"answer": answer}
+
+
+
+@app.get("/chat_history/")
+async def get_chat_history():
+    return {"chat_history": chat_history}
+
+@app.get("/chunks/")
+async def get_chunks():
+    return {"chunks": chunks}
