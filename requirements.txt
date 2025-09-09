@@ -1,0 +1,6 @@
+langchain_docling
+fastapi
+langchain
+pinecone
+langchain_pinecone
+langchain_openai
